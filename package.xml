@@ -15,10 +15,6 @@ http://pear.php.net/dtd/package-2.0.xsd">
     <email>jay@php.net</email>
     <active>yes</active>
   </lead>
-  <lead>
-    <name>Sandro Santilli</name>
-    <email>strk@keybit.net</email>
-  </lead>
   <date>2016-01-19</date>
   <version>
     <release>0.0.1</release>
