@@ -117,27 +117,38 @@ static void errorHandler(const char *fmt, ...)
     va_end(args);
 
     /* TODO: use a GEOSException ? */
-    zend_throw_exception_ex(zend_exception_get_default(TSRMLS_C),
-        1 TSRMLS_CC, "%s", message);
+    zend_throw_exception_ex(zend_exception_get_default(),
+        1, "%s", message);
 
 }
 
+int id = 0;
+
 typedef struct Proxy_t {
-    zend_object std;
+    int id;
     void* relay;
+    zend_object std;
 } Proxy;
+
+static inline Proxy *php_geos_fetch_object(zend_object *obj) {
+  return (Proxy *)((char *) obj - XtOffsetOf(Proxy, std));
+}
+
+#define Z_GEOS_OBJ_P(zv) php_geos_fetch_object(Z_OBJ_P(zv));
 
 static void
 setRelay(zval* val, void* obj) {
     TSRMLS_FETCH();
-    Proxy* proxy = (Proxy*)zend_object_store_get_object(val TSRMLS_CC);
+    Proxy* proxy = Z_GEOS_OBJ_P(val);
+
     proxy->relay = obj;
 }
 
 static inline void *
 getRelay(zval* val, zend_class_entry* ce) {
     TSRMLS_FETCH();
-    Proxy *proxy =  (Proxy*)zend_object_store_get_object(val TSRMLS_CC);
+    Proxy *proxy =  Z_GEOS_OBJ_P(val);
+
     if ( proxy->std.ce != ce ) {
         php_error_docref(NULL TSRMLS_CC, E_ERROR,
             "Relay object is not an %s", ce->name);
@@ -175,30 +186,20 @@ static long getZvalAsDouble(zval* val)
     return ret;
 }
 
-static zend_object_value
-Gen_create_obj (zend_class_entry *type,
-    zend_objects_free_object_storage_t st, zend_object_handlers* handlers)
+static zend_object *
+Gen_create_obj (zend_class_entry *type, zend_object_handlers* handlers)
 {
     TSRMLS_FETCH();
-    zend_object_value retval;
+    Proxy *obj = (Proxy *) ecalloc(1, sizeof(Proxy) + zend_object_properties_size(type));
 
-    Proxy *obj = (Proxy *)emalloc(sizeof(Proxy));
-    memset(obj, 0, sizeof(Proxy));
-    obj->std.ce = type;
+    obj->id = id++;
 
-    ALLOC_HASHTABLE(obj->std.properties);
-    zend_hash_init(obj->std.properties, 0, NULL, ZVAL_PTR_DTOR, 0);
-#if PHP_VERSION_ID < 50399
-    zend_hash_copy(obj->std.properties, &type->default_properties,
-        (copy_ctor_func_t)zval_add_ref, NULL, sizeof(zval *));
-#else
-    object_properties_init(&(obj->std), type);
-#endif
+    zend_object_std_init(&obj->std, type);
+    object_properties_init(&obj->std, type);
 
-    retval.handle = zend_objects_store_put(obj, NULL, st, NULL TSRMLS_CC);
-    retval.handlers = handlers;
+    obj->std.handlers = handlers;
 
-    return retval;
+    return &obj->std;
 }
 
 
@@ -539,14 +540,13 @@ static void delGeometryDeserializer()
 /* Serializer function for GEOSGeometry */
 
 static int
-Geometry_serialize(zval *object, unsigned char **buffer, zend_uint *buf_len,
+Geometry_serialize(zval *object, unsigned char **buffer, size_t *buf_len,
         zend_serialize_data *data TSRMLS_DC)
 {
     GEOSWKBWriter *serializer;
     GEOSGeometry *geom;
     char* ret;
     size_t retsize;
-
 
     serializer = getGeometrySerializer();
     geom = (GEOSGeometry*)getRelay(object, Geometry_ce_ptr);
@@ -565,8 +565,8 @@ Geometry_serialize(zval *object, unsigned char **buffer, zend_uint *buf_len,
 }
 
 static int
-Geometry_deserialize(zval **object, zend_class_entry *ce, const unsigned char *buf,
-        zend_uint buf_len, zend_unserialize_data *data TSRMLS_DC)
+Geometry_deserialize(zval *object, zend_class_entry *ce, const unsigned char *buf,
+        size_t buf_len, zend_unserialize_data *data TSRMLS_DC)
 {
     GEOSWKBReader* deserializer;
     GEOSGeometry* geom;
@@ -580,8 +580,8 @@ Geometry_deserialize(zval **object, zend_class_entry *ce, const unsigned char *b
                 "Geometry_deserialize called with unexpected zend_class_entry");
         return FAILURE;
     }
-    object_init_ex(*object, ce);
-    setRelay(*object, geom);
+    object_init_ex(object, ce);
+    setRelay(object, geom);
 
     return SUCCESS;
 }
@@ -614,7 +614,7 @@ dumpGeometry(GEOSGeometry* g, zval* array)
         cc = GEOSGeom_clone_r(GEOS_G(handle), c);
         if ( ! cc ) continue; /* should get an exception */
 
-        MAKE_STD_ZVAL(tmp);
+        // MAKE_STD_ZVAL(tmp);
         object_init_ex(tmp, Geometry_ce_ptr);
         setRelay(tmp, cc);
         add_next_index_zval(array, tmp);
@@ -623,21 +623,29 @@ dumpGeometry(GEOSGeometry* g, zval* array)
 
 
 static void
-Geometry_dtor (void *object TSRMLS_DC)
+Geometry_dtor (zend_object *object TSRMLS_DC)
 {
-    Proxy *obj = (Proxy *)object;
-    GEOSGeom_destroy_r(GEOS_G(handle), (GEOSGeometry*)obj->relay);
+    Proxy *obj = php_geos_fetch_object(object);
+    GEOSGeometry *geometry = (GEOSGeometry*) obj->relay;
 
-    zend_hash_destroy(obj->std.properties);
-    FREE_HASHTABLE(obj->std.properties);
+    printf("GEOMETRY DTOR FOR %d\n", obj->id);
 
-    efree(obj);
+    if (geometry) {
+        GEOSGeom_destroy_r(GEOS_G(handle), geometry);
+    }
+
+    zend_object_std_dtor(&obj->std);
+
+    // zend_hash_destroy(obj->std.properties);
+    // FREE_HASHTABLE(obj->std.properties);
+    //
+    // efree(obj);
 }
 
-static zend_object_value
+static zend_object *
 Geometry_create_obj (zend_class_entry *type TSRMLS_DC)
 {
-    return Gen_create_obj(type, Geometry_dtor, &Geometry_object_handlers);
+    return Gen_create_obj(type, &Geometry_object_handlers);
 }
 
 
@@ -676,7 +684,7 @@ PHP_METHOD(Geometry, __toString)
     ret = estrdup(wkt);
     GEOSFree_r(GEOS_G(handle), wkt);
 
-    RETURN_STRING(ret, 0);
+    RETURN_STRING(ret);
 }
 
 PHP_METHOD(Geometry, project)
@@ -771,10 +779,10 @@ PHP_METHOD(Geometry, buffer)
     double mitreLimit = default_mitreLimit;
     long singleSided = 0;
     zval *style_val = NULL;
-    zval **data;
+    zval *data;
     HashTable *style;
-    char *key;
-    ulong index;
+    zend_string *key;
+    zend_ulong index;
 
     this = (GEOSGeometry*)getRelay(getThis(), Geometry_ce_ptr);
 
@@ -788,37 +796,37 @@ PHP_METHOD(Geometry, buffer)
     if ( style_val )
     {
         style = HASH_OF(style_val);
-        while(zend_hash_get_current_key(style, &key, &index, 0)
+        while(zend_hash_get_current_key(style, &key, &index)
               == HASH_KEY_IS_STRING)
         {
-            if(!strcmp(key, "quad_segs"))
+            if(!strcmp(ZSTR_VAL(key), "quad_segs"))
             {
-                zend_hash_get_current_data(style, (void**)&data);
-                quadSegs = getZvalAsLong(*data);
+                data = zend_hash_get_current_data(style);
+                quadSegs = getZvalAsLong(data);
                 GEOSBufferParams_setQuadrantSegments_r(GEOS_G(handle), params, quadSegs);
             }
-            else if(!strcmp(key, "endcap"))
+            else if(!strcmp(ZSTR_VAL(key), "endcap"))
             {
-                zend_hash_get_current_data(style, (void**)&data);
-                endCapStyle = getZvalAsLong(*data);
+                data = zend_hash_get_current_data(style);
+                endCapStyle = getZvalAsLong(data);
                 GEOSBufferParams_setEndCapStyle_r(GEOS_G(handle), params, endCapStyle);
             }
-            else if(!strcmp(key, "join"))
+            else if(!strcmp(ZSTR_VAL(key), "join"))
             {
-                zend_hash_get_current_data(style, (void**)&data);
-                joinStyle = getZvalAsLong(*data);
+                data = zend_hash_get_current_data(style);
+                joinStyle = getZvalAsLong(data);
                 GEOSBufferParams_setJoinStyle_r(GEOS_G(handle), params, joinStyle);
             }
-            else if(!strcmp(key, "mitre_limit"))
+            else if(!strcmp(ZSTR_VAL(key), "mitre_limit"))
             {
-                zend_hash_get_current_data(style, (void**)&data);
-                mitreLimit = getZvalAsDouble(*data);
+                data = zend_hash_get_current_data(style);
+                mitreLimit = getZvalAsDouble(data);
                 GEOSBufferParams_setMitreLimit_r(GEOS_G(handle), params, mitreLimit);
             }
-            else if(!strcmp(key, "single_sided"))
+            else if(!strcmp(ZSTR_VAL(key), "single_sided"))
             {
-                zend_hash_get_current_data(style, (void**)&data);
-                singleSided = getZvalAsLong(*data);
+                data = zend_hash_get_current_data(style);
+                singleSided = getZvalAsLong(data);
                 GEOSBufferParams_setSingleSided_r(GEOS_G(handle), params, singleSided);
             }
 
@@ -864,10 +872,10 @@ PHP_METHOD(Geometry, offsetCurve)
     long int joinStyle = default_joinStyle;
     double mitreLimit = default_mitreLimit;
     zval *style_val = NULL;
-    zval **data;
+    zval *data;
     HashTable *style;
-    char *key;
-    ulong index;
+    zend_string *key;
+    zend_ulong index;
 
     this = (GEOSGeometry*)getRelay(getThis(), Geometry_ce_ptr);
 
@@ -879,23 +887,23 @@ PHP_METHOD(Geometry, offsetCurve)
     if ( style_val )
     {
         style = HASH_OF(style_val);
-        while(zend_hash_get_current_key(style, &key, &index, 0)
+        while(zend_hash_get_current_key(style, &key, &index)
               == HASH_KEY_IS_STRING)
         {
-            if(!strcmp(key, "quad_segs"))
+            if(!strcmp(ZSTR_VAL(key), "quad_segs"))
             {
-                zend_hash_get_current_data(style, (void**)&data);
-                quadSegs = getZvalAsLong(*data);
+                data = zend_hash_get_current_data(style);
+                quadSegs = getZvalAsLong(data);
             }
-            else if(!strcmp(key, "join"))
+            else if(!strcmp(ZSTR_VAL(key), "join"))
             {
-                zend_hash_get_current_data(style, (void**)&data);
-                joinStyle = getZvalAsLong(*data);
+                data = zend_hash_get_current_data(style);
+                joinStyle = getZvalAsLong(data);
             }
-            else if(!strcmp(key, "mitre_limit"))
+            else if(!strcmp(ZSTR_VAL(key), "mitre_limit"))
             {
-                zend_hash_get_current_data(style, (void**)&data);
-                mitreLimit = getZvalAsDouble(*data);
+                data = zend_hash_get_current_data(style);
+                mitreLimit = getZvalAsDouble(data);
             }
 
             zend_hash_move_forward(style);
@@ -1132,34 +1140,50 @@ PHP_METHOD(Geometry, relate)
     GEOSGeometry *this;
     GEOSGeometry *other;
     zval *zobj;
-    char* pat = NULL;
-    int patlen;
-    int retInt;
-    zend_bool retBool;
-    char* retStr;
+    zend_string *patternArg = NULL;
 
     this = (GEOSGeometry*)getRelay(getThis(), Geometry_ce_ptr);
 
-    if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "o|s",
-        &zobj, &pat, &patlen) == FAILURE)
+    if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "o|S",
+        &zobj, &patternArg) == FAILURE)
     {
         RETURN_NULL();
     }
 
     other = getRelay(zobj, Geometry_ce_ptr);
 
-    if ( ! pat ) {
-        /* we'll compute it */
-        pat = GEOSRelate_r(GEOS_G(handle), this, other);
-        if ( ! pat ) RETURN_NULL(); /* should get an exception first */
-        retStr = estrdup(pat);
-        GEOSFree_r(GEOS_G(handle), pat);
-        RETURN_STRING(retStr, 0);
+    if (!patternArg) {
+        {
+            zend_string *retStr;
+            char *pattern;
+
+            /* we'll compute it */
+            pattern = GEOSRelate_r(GEOS_G(handle), this, other);
+
+            if (!pattern) {
+                RETURN_NULL(); /* should get an exception first */
+            }
+
+            retStr = zend_string_init(pattern, strlen(pattern), 0);
+            GEOSFree_r(GEOS_G(handle), pattern);
+
+            RETURN_STR(retStr);
+        }
     } else {
-        retInt = GEOSRelatePattern_r(GEOS_G(handle), this, other, pat);
-        if ( retInt == 2 ) RETURN_NULL(); /* should get an exception first */
-        retBool = retInt;
-        RETURN_BOOL(retBool);
+        {
+            int retInt;
+            zend_bool retBool;
+
+            retInt = GEOSRelatePattern_r(GEOS_G(handle), this, other, ZSTR_VAL(patternArg));
+
+            if (retInt == 2) {
+                RETURN_NULL(); /* should get an exception first */
+            }
+
+            retBool = retInt;
+
+            RETURN_BOOL(retBool);
+        }
     }
 
 }
@@ -1192,7 +1216,7 @@ PHP_METHOD(Geometry, relateBoundaryNodeRule)
     if ( ! pat ) RETURN_NULL(); /* should get an exception first */
     retStr = estrdup(pat);
     GEOSFree_r(GEOS_G(handle), pat);
-    RETURN_STRING(retStr, 0);
+    RETURN_STRING(retStr);
 }
 #endif
 
@@ -1667,7 +1691,7 @@ PHP_METHOD(Geometry, checkValidity)
     }
 
     if ( location ) {
-        MAKE_STD_ZVAL(locationVal);
+        // MAKE_STD_ZVAL(locationVal);
         object_init_ex(locationVal, Geometry_ce_ptr);
         setRelay(locationVal, location);
     }
@@ -1677,7 +1701,7 @@ PHP_METHOD(Geometry, checkValidity)
     /* return value is an array */
     array_init(return_value);
     add_assoc_bool(return_value, "valid", retBool);
-    if ( reasonVal ) add_assoc_string(return_value, "reason", reasonVal, 0);
+    if ( reasonVal ) add_assoc_string(return_value, "reason", reasonVal);
     if ( locationVal ) add_assoc_zval(return_value, "location", locationVal);
 
 }
@@ -1780,7 +1804,7 @@ PHP_METHOD(Geometry, typeName)
     typVal = estrdup(typ);
     GEOSFree_r(GEOS_G(handle), typ);
 
-    RETURN_STRING(typVal, 0);
+    RETURN_STRING(typVal);
 }
 
 /**
@@ -2256,21 +2280,27 @@ static zend_class_entry *WKTReader_ce_ptr;
 static zend_object_handlers WKTReader_object_handlers;
 
 static void
-WKTReader_dtor (void *object TSRMLS_DC)
+WKTReader_dtor (zend_object *object TSRMLS_DC)
 {
-    Proxy *obj = (Proxy *)object;
-    GEOSWKTReader_destroy_r(GEOS_G(handle), (GEOSWKTReader*)obj->relay);
+    Proxy *obj = php_geos_fetch_object(object);
+    GEOSWKTReader *reader = (GEOSWKTReader*)obj->relay;
 
-    zend_hash_destroy(obj->std.properties);
-    FREE_HASHTABLE(obj->std.properties);
+    if (reader) {
+        GEOSWKTReader_destroy_r(GEOS_G(handle), reader);
+    }
 
-    efree(obj);
+    zend_object_std_dtor(&obj->std);
+
+    // zend_hash_destroy(obj->std.properties);
+    // FREE_HASHTABLE(obj->std.properties);
+    //
+    // efree(obj);
 }
 
-static zend_object_value
+static zend_object *
 WKTReader_create_obj (zend_class_entry *type TSRMLS_DC)
 {
-    return Gen_create_obj(type, WKTReader_dtor, &WKTReader_object_handlers);
+    return Gen_create_obj(type, &WKTReader_object_handlers);
 }
 
 
@@ -2292,18 +2322,17 @@ PHP_METHOD(WKTReader, read)
 {
     GEOSWKTReader *reader;
     GEOSGeometry *geom;
-    char* wkt;
-    int wktlen;
+    zend_string *wkt;
 
     reader = (GEOSWKTReader*)getRelay(getThis(), WKTReader_ce_ptr);
 
-    if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s",
-        &wkt, &wktlen) == FAILURE)
+    if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "S",
+        &wkt) == FAILURE)
     {
         RETURN_NULL();
     }
 
-    geom = GEOSWKTReader_read_r(GEOS_G(handle), reader, wkt);
+    geom = GEOSWKTReader_read_r(GEOS_G(handle), reader, ZSTR_VAL(wkt));
     /* we'll probably get an exception if geom is null */
     if ( ! geom ) RETURN_NULL();
 
@@ -2370,21 +2399,27 @@ static zend_class_entry *WKTWriter_ce_ptr;
 static zend_object_handlers WKTWriter_object_handlers;
 
 static void
-WKTWriter_dtor (void *object TSRMLS_DC)
+WKTWriter_dtor (zend_object *object TSRMLS_DC)
 {
-    Proxy *obj = (Proxy *)object;
-    GEOSWKTWriter_destroy_r(GEOS_G(handle), (GEOSWKTWriter*)obj->relay);
+    Proxy *obj = php_geos_fetch_object(object);
+    GEOSWKTWriter *writer = (GEOSWKTWriter*)obj->relay;
 
-    zend_hash_destroy(obj->std.properties);
-    FREE_HASHTABLE(obj->std.properties);
+    if (writer) {
+        GEOSWKTWriter_destroy_r(GEOS_G(handle), (GEOSWKTWriter*)obj->relay);
+    }
 
-    efree(obj);
+    zend_object_std_dtor(&obj->std);
+
+    // zend_hash_destroy(obj->std.properties);
+    // FREE_HASHTABLE(obj->std.properties);
+    //
+    // efree(obj);
 }
 
-static zend_object_value
+static zend_object *
 WKTWriter_create_obj (zend_class_entry *type TSRMLS_DC)
 {
-    return Gen_create_obj(type, WKTWriter_dtor, &WKTWriter_object_handlers);
+    return Gen_create_obj(type, &WKTWriter_object_handlers);
 }
 
 PHP_METHOD(WKTWriter, __construct)
@@ -2426,7 +2461,7 @@ PHP_METHOD(WKTWriter, write)
     retstr = estrdup(wkt);
     GEOSFree_r(GEOS_G(handle), wkt);
 
-    RETURN_STRING(retstr, 0);
+    RETURN_STRING(retstr);
 }
 
 #ifdef HAVE_GEOS_WKT_WRITER_SET_TRIM
@@ -2495,7 +2530,7 @@ PHP_METHOD(WKTWriter, setOutputDimension)
 PHP_METHOD(WKTWriter, getOutputDimension)
 {
     GEOSWKTWriter *writer;
-    long int ret;
+    zend_long ret;
 
     writer = (GEOSWKTWriter*)getRelay(getThis(), WKTWriter_ce_ptr);
 
@@ -2555,21 +2590,24 @@ static zend_class_entry *WKBWriter_ce_ptr;
 static zend_object_handlers WKBWriter_object_handlers;
 
 static void
-WKBWriter_dtor (void *object TSRMLS_DC)
+WKBWriter_dtor (zend_object *object TSRMLS_DC)
 {
-    Proxy *obj = (Proxy *)object;
+    Proxy *obj = php_geos_fetch_object(object);
     GEOSWKBWriter_destroy_r(GEOS_G(handle), (GEOSWKBWriter*)obj->relay);
 
-    zend_hash_destroy(obj->std.properties);
-    FREE_HASHTABLE(obj->std.properties);
 
-    efree(obj);
+    zend_object_std_dtor(&obj->std);
+
+    // zend_hash_destroy(obj->std.properties);
+    // FREE_HASHTABLE(obj->std.properties);
+    //
+    // efree(obj);
 }
 
-static zend_object_value
+static zend_object *
 WKBWriter_create_obj (zend_class_entry *type TSRMLS_DC)
 {
-    return Gen_create_obj(type, WKBWriter_dtor, &WKBWriter_object_handlers);
+    return Gen_create_obj(type, &WKBWriter_object_handlers);
 }
 
 /**
@@ -2653,7 +2691,7 @@ PHP_METHOD(WKBWriter, write)
     retstr = estrndup(ret, retsize);
     GEOSFree_r(GEOS_G(handle), ret);
 
-    RETURN_STRINGL(retstr, retsize, 0);
+    RETURN_STRINGL(retstr, retsize);
 }
 
 /**
@@ -2685,7 +2723,7 @@ PHP_METHOD(WKBWriter, writeHEX)
     retstr = estrndup(ret, retsize);
     GEOSFree_r(GEOS_G(handle), ret);
 
-    RETURN_STRING(retstr, 0);
+    RETURN_STRING(retstr);
 }
 
 /**
@@ -2779,21 +2817,24 @@ static zend_class_entry *WKBReader_ce_ptr;
 static zend_object_handlers WKBReader_object_handlers;
 
 static void
-WKBReader_dtor (void *object TSRMLS_DC)
+WKBReader_dtor (zend_object *object TSRMLS_DC)
 {
-    Proxy *obj = (Proxy *)object;
+    Proxy *obj = php_geos_fetch_object(object);
+
     GEOSWKBReader_destroy_r(GEOS_G(handle), (GEOSWKBReader*)obj->relay);
 
-    zend_hash_destroy(obj->std.properties);
-    FREE_HASHTABLE(obj->std.properties);
+    zend_object_std_dtor(&obj->std);
 
-    efree(obj);
+    // zend_hash_destroy(obj->std.properties);
+    // FREE_HASHTABLE(obj->std.properties);
+    //
+    // efree(obj);
 }
 
-static zend_object_value
+static zend_object *
 WKBReader_create_obj (zend_class_entry *type TSRMLS_DC)
 {
-    return Gen_create_obj(type, WKBReader_dtor, &WKBReader_object_handlers);
+    return Gen_create_obj(type, &WKBReader_object_handlers);
 }
 
 
@@ -2872,7 +2913,7 @@ PHP_FUNCTION(GEOSVersion)
     char *str;
 
     str = estrdup(GEOSversion());
-    RETURN_STRING(str, 0);
+    RETURN_STRING(str);
 }
 
 /**
@@ -2921,25 +2962,25 @@ PHP_FUNCTION(GEOSPolygonize)
     /* return value should be an array */
     array_init(return_value);
 
-    MAKE_STD_ZVAL(array_elem);
+    // MAKE_STD_ZVAL(array_elem);
     array_init(array_elem);
     dumpGeometry(rings, array_elem);
     GEOSGeom_destroy_r(GEOS_G(handle), rings);
     add_assoc_zval(return_value, "rings", array_elem);
 
-    MAKE_STD_ZVAL(array_elem);
+    // MAKE_STD_ZVAL(array_elem);
     array_init(array_elem);
     dumpGeometry(cut_edges, array_elem);
     GEOSGeom_destroy_r(GEOS_G(handle), cut_edges);
     add_assoc_zval(return_value, "cut_edges", array_elem);
 
-    MAKE_STD_ZVAL(array_elem);
+    // MAKE_STD_ZVAL(array_elem);
     array_init(array_elem);
     dumpGeometry(dangles, array_elem);
     GEOSGeom_destroy_r(GEOS_G(handle), dangles);
     add_assoc_zval(return_value, "dangles", array_elem);
 
-    MAKE_STD_ZVAL(array_elem);
+    // MAKE_STD_ZVAL(array_elem);
     array_init(array_elem);
     dumpGeometry(invalid_rings, array_elem);
     GEOSGeom_destroy_r(GEOS_G(handle), invalid_rings);
@@ -3118,6 +3159,7 @@ PHP_MINIT_FUNCTION(geos)
     memcpy(&WKTReader_object_handlers,
         zend_get_std_object_handlers(), sizeof(zend_object_handlers));
     WKTReader_object_handlers.clone_obj = NULL;
+    WKTReader_object_handlers.free_obj = WKTReader_dtor;
 
     /* WKTWriter */
     INIT_CLASS_ENTRY(ce, "GEOSWKTWriter", WKTWriter_methods);
@@ -3126,6 +3168,7 @@ PHP_MINIT_FUNCTION(geos)
     memcpy(&WKTWriter_object_handlers,
         zend_get_std_object_handlers(), sizeof(zend_object_handlers));
     WKTWriter_object_handlers.clone_obj = NULL;
+    WKTWriter_object_handlers.free_obj = WKTWriter_dtor;
 
     /* Geometry */
     INIT_CLASS_ENTRY(ce, "GEOSGeometry", Geometry_methods);
@@ -3134,6 +3177,8 @@ PHP_MINIT_FUNCTION(geos)
     memcpy(&Geometry_object_handlers,
         zend_get_std_object_handlers(), sizeof(zend_object_handlers));
     Geometry_object_handlers.clone_obj = NULL;
+    Geometry_object_handlers.free_obj = Geometry_dtor;
+
     /* Geometry serialization */
     Geometry_ce_ptr->serialize = Geometry_serialize;
     Geometry_ce_ptr->unserialize = Geometry_deserialize;
@@ -3145,6 +3190,7 @@ PHP_MINIT_FUNCTION(geos)
     memcpy(&WKBWriter_object_handlers,
         zend_get_std_object_handlers(), sizeof(zend_object_handlers));
     WKBWriter_object_handlers.clone_obj = NULL;
+    WKBWriter_object_handlers.free_obj = WKBWriter_dtor;
 
     /* WKBReader */
     INIT_CLASS_ENTRY(ce, "GEOSWKBReader", WKBReader_methods);
@@ -3153,6 +3199,7 @@ PHP_MINIT_FUNCTION(geos)
     memcpy(&WKBReader_object_handlers,
         zend_get_std_object_handlers(), sizeof(zend_object_handlers));
     WKBReader_object_handlers.clone_obj = NULL;
+    WKBReader_object_handlers.free_obj = WKBReader_dtor;
 
 
     /* Constants */
